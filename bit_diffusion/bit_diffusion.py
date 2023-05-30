@@ -1,10 +1,13 @@
 import math
+import time
 from pathlib import Path
 from random import random
 from functools import partial
 from multiprocessing import cpu_count
 
 import torch
+import torch as th
+import numpy as np
 from torch import nn, einsum
 from torch.special import expm1
 import torch.nn.functional as F
@@ -25,6 +28,7 @@ from accelerate import Accelerator
 
 # constants
 from bit_diffusion.lidcloader_mose import lidc_Dataloader
+from bit_diffusion.metrics import calc_batched_generalised_energy_distance, batched_hungarian_matching
 
 BITS = 1
 
@@ -314,10 +318,10 @@ class Unet(nn.Module):
 
     def forward(self, x, condition, time, x_self_cond=None):
 
-        x_con = torch.cat([x, condition], dim=1)
+        x_con = torch.cat([x, condition], dim=1)  # train: x (2, 1, 128, 128), condition (2, 2, 128, 128)
 
         x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
-        x = torch.cat((x_self_cond, x_con), dim=1)
+        x = torch.cat((x_self_cond, x_con), dim=1)  # eval: x (8, 1, 128, 128)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -374,7 +378,7 @@ def decimal_to_bits(x, bits=BITS):
     return bits
 
 
-def bits_to_decimal(x, bits=BITS):
+def bits_to_decimal(x, bits=BITS, max_value=1):
     """ expects bits from -1 to 1, outputs image tensor from 0 to 1 """
     device = x.device
 
@@ -382,10 +386,11 @@ def bits_to_decimal(x, bits=BITS):
     mask = 2 ** torch.arange(bits - 1, -1, -1, device=device, dtype=torch.int32)
 
     mask = rearrange(mask, 'd -> d 1 1')
-    x = rearrange(x, 'b (c d) h w -> b c d h w', d=8)
+    x = rearrange(x, 'b (c d) h w -> b c d h w', d=bits)
     dec = reduce(x * mask, 'b c d h w -> b c h w', 'sum')
-    return (dec / 255).clamp(0., 1.)
-
+    # return (dec / 255).clamp(0., 1.)
+    dec = torch.clamp(dec, min=0, max=max_value)
+    return dec
 
 # bit diffusion class
 
@@ -460,7 +465,7 @@ class BitDiffusion(nn.Module):
         return times
 
     @torch.no_grad()
-    def ddpm_sample(self, shape, time_difference=None):
+    def ddpm_sample(self, shape, condition, time_difference=None):
         batch, device = shape[0], self.device
 
         time_difference = default(time_difference, self.time_difference)
@@ -468,6 +473,7 @@ class BitDiffusion(nn.Module):
         time_pairs = self.get_sampling_timesteps(batch, device=device)
 
         img = torch.randn(shape, device=device)
+        condition = condition.to(device)
 
         x_start = None
 
@@ -479,7 +485,7 @@ class BitDiffusion(nn.Module):
             noise_cond = self.log_snr(time)
 
             # get predicted x0
-            image = None  # TODO: get image from dataset
+            image = condition
             x_start = self.model(img, image, noise_cond, x_start)
 
             # clip x0
@@ -518,7 +524,7 @@ class BitDiffusion(nn.Module):
         return bits_to_decimal(img)
 
     @torch.no_grad()
-    def ddim_sample(self, shape, time_difference=None):
+    def ddim_sample(self, shape, condition, time_difference=None):
         batch, device = shape[0], self.device
 
         time_difference = default(time_difference, self.time_difference)
@@ -526,6 +532,7 @@ class BitDiffusion(nn.Module):
         time_pairs = self.get_sampling_timesteps(batch, device=device)
 
         img = torch.randn(shape, device=device)
+        condition = condition.to(device)
 
         x_start = None
 
@@ -545,7 +552,7 @@ class BitDiffusion(nn.Module):
             times_next = (times_next - time_difference).clamp(min=0.)
 
             # predict x0
-            image = None  # TODO: get image from dataset
+            image = condition
             x_start = self.model(img, image, log_snr, x_start)
 
             # clip x0
@@ -563,10 +570,10 @@ class BitDiffusion(nn.Module):
         return bits_to_decimal(img)
 
     @torch.no_grad()
-    def sample(self, batch_size=16):
-        image_size, channels = self.image_size, self.channels
+    def sample(self, condition, batch_size=16):
+        image_size, channels = self.image_size, 1  # self.channels
         sample_fn = self.ddpm_sample if not self.use_ddim else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size))
+        return sample_fn((batch_size, channels, image_size, image_size), condition)
 
     def forward(self, data, *args, **kwargs):
         image, x0 = data
@@ -683,7 +690,8 @@ class Trainer(object):
             amp=False,
             fp16=False,
             split_batches=True,
-            pil_img_type=None
+            pil_img_type=None,
+            eval_mode="train"
     ):
         super().__init__()
 
@@ -710,16 +718,29 @@ class Trainer(object):
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = pil_img_type)
 
-        self.ds = lidc_Dataloader(
+        lidc_loader = lidc_Dataloader(
             data_folder=folder,
             transform_train=transform,
             transform_test=None
-        ).train_ds
+        )
+        if eval_mode == "train":
+            self.ds = lidc_loader.train_ds
+        elif eval_mode == "test":
+            self.ds = lidc_loader.test_ds
+        elif eval_mode == "val":
+            self.ds = lidc_loader.val_ds
+            max_size = 6
+            self.ds, _ = torch.utils.data.random_split(self.ds, [max_size, len(self.ds) - max_size],
+                                                       generator=torch.Generator().manual_seed(1))
+        else:
+            raise ValueError("eval_mode must be one of 'train', 'test', or 'val'")
 
         dl = DataLoader(self.ds, batch_size=train_batch_size,
                         shuffle=True,
                         pin_memory=True,
-                        num_workers=4)  # cpu_count())
+                        num_workers=0)  # cpu_count())
+
+        self.dataloader = dl
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -758,8 +779,13 @@ class Trainer(object):
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
-    def load(self, milestone):
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+    def load(self, milestone, is_abs_path=False):
+        if not is_abs_path:
+            milestone = str(self.results_folder / f'model-{milestone}.pt')
+
+        data = torch.load(milestone)
+
+        print("Loaded checkpoint from {}".format(milestone), flush=True)
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
@@ -823,3 +849,55 @@ class Trainer(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+    @torch.no_grad()
+    def eval(self):
+        self.ema.ema_model.eval()
+
+        # with torch.no_grad():
+        #     batches = num_to_groups(self.num_samples, self.batch_size)
+        #     all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+
+        datal = self.dataloader
+        ds = datal.dataset
+        len_dataset = len(ds)
+        data = iter(datal)
+        data_len = len(data)
+
+        geds = 0
+        hm_ious = 0
+
+        num_imgs = 0
+
+        dm_type = "DDIM" if self.ema.ema_model.use_ddim else "DDPM"
+        print(f"Calculating GED and HM-Iou with N={self.num_samples} over {len_dataset} samples (w/ {dm_type})..")
+
+        for idx, (b, label) in enumerate(data):
+
+            img = b
+            img = img.repeat_interleave(self.num_samples, dim=0)
+
+            sample = self.ema.ema_model.sample(img, img.shape[0])
+
+            sample = sample.reshape(label.shape[0], -1, *label.shape[2:])  # (2, 4, 128, 128)
+            predictions = sample  # eq. to sample[:, :self.num_samples]
+
+            label = label
+
+            ged = calc_batched_generalised_energy_distance(label.cpu().numpy(), predictions.cpu().numpy(), num_classes=2)
+            geds += np.sum(ged)
+
+            lcm = np.lcm(self.num_samples, label.shape[1])
+            hm_labels = label.repeat_interleave(lcm // label.shape[1], dim=1).cpu().numpy()
+            predictions = predictions.repeat_interleave(lcm // self.num_samples, dim=1).cpu().numpy()
+            assert all([p in [0, 1] for p in np.unique(predictions)]), "predictions must contain all classes"
+            hm_iou = batched_hungarian_matching(hm_labels, predictions, num_classes=2)
+            hm_ious += np.sum(hm_iou)
+            num_imgs += b.shape[0]
+            print("%s | Batch %d/%d (%d/%d) | GED_%d: %.4g, HM-IoU_%d: %.4g" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                                                      idx + 1, data_len, num_imgs, len_dataset, self.num_samples,
+                                                                                      np.sum(ged) / predictions.shape[0], self.num_samples,
+                                                                                      np.sum(hm_iou) / predictions.shape[0]))
+
+        print("\n\n%s | GED_%d: %.4g, HM-IoU_%d: %.4g" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), self.num_samples, geds / len_dataset, self.num_samples, hm_ious / len_dataset))
